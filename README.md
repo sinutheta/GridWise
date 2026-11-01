@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Carbon-Aware Training: Decision-Focused Scheduling & Calibrated Forecasts
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -152,3 +153,7 @@ streamlit run app/streamlit_app.py
 ## 5. License
 
 MIT License. See [LICENSE](LICENSE) for details.
+=======
+# GridWise
+Carbon-Aware GPU Scheduling ; Forecasting Grid Carbon Intensity to Cut Training Emissions.
+>>>>>>> 1ca7cb9d8173180b1c19667292560d84fe4a571c
