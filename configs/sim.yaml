@@ -1,0 +1,8 @@
+d_grid: [2, 4, 8, 16]         # Duration in slots (1h, 2h, 4h, 8h)
+slack_grid: [12, 24, 48, 96]   # Max delay in slots (6h, 12h, 24h, 48h)
+power_kw: 1.0                  # Standard 1 kW reference power
+tie_break_eps: 1.0e-4          # Prefer earlier start if cost difference < eps
+bootstrap_samples: 500
+bootstrap_block_days: 1        # Resample in daily blocks (48 slots)
+output_dir: "results/tables"
+figures_dir: "results/figures"

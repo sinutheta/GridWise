@@ -1,0 +1,11 @@
+raw_dir: "data/raw"
+processed_dir: "data/processed"
+intensity_file: "data/processed/intensity.parquet"
+base_url: "https://api.carbonintensity.org.uk/intensity"
+chunk_days: 14
+pause: 0.3
+lookback: 336        # 7 days * 48 half-hours
+horizon: 96          # 48 hours * 2 half-hours
+split_ratios: [0.70, 0.15, 0.15]
+split_gap_hours: 48  # Gap between splits to avoid window overlap leakage
+future_weather: false

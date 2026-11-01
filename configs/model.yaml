@@ -1,0 +1,5 @@
+blocks: 3
+pool: [8, 4, 1]
+hidden: 256
+mlp_layers: 2
+dropout: 0.1

@@ -1,0 +1,13 @@
+mode: "simulated"              # "simulated" or "real"
+checkpoint_dir: "checkpoints"
+slot_length_min: 30
+steps_per_slot: 100
+total_steps: 1000
+deadline_slots: 24
+job_slots: 10
+safety_margin_slots: 2
+policy: "planned_slots"         # "planned_slots" or "threshold"
+threshold_quantile: 0.35
+atomic_checkpoint: true
+track_codecarbon: false         # Toggle CodeCarbon measurement
+measure_power_secs: 5

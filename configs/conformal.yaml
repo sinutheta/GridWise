@@ -1,0 +1,6 @@
+alpha: 0.1
+q_lo: 0.05
+q_hi: 0.95
+rolling_recalibration: false
+recalibration_window_weeks: 4
+method: higher

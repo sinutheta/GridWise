@@ -1,0 +1,25 @@
+seed_list: [0, 1, 2, 3, 4]
+data:
+  lookback: 336
+  horizon: 96
+  future_weather: false
+model:
+  blocks: 3
+  pool: [8, 4, 1]
+  hidden: 256
+  dropout: 0.1
+  quantiles: null
+loss:
+  type: decision
+  lam: 0.1
+  tau: 5.0
+  d_list: [2, 4, 8, 16]
+  slack_list: [12, 24, 48, 96]
+  anneal_tau: true
+train:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 256
+  early_stop_patience: 5
+  early_stop_metric: val_regret
