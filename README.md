@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Carbon-Aware Training: Decision-Focused Scheduling & Calibrated Forecasts
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -36,7 +35,32 @@ flowchart TD
 
 ---
 
-## 2. Repository Layout
+## 2. Dataset & External Sources
+
+### 2.1 Real UK National Grid Carbon Intensity
+- **Source**: National Energy System Operator (NESO) Carbon Intensity API ([https://api.carbonintensity.org.uk](https://api.carbonintensity.org.uk)).
+- **Target Variable**: Half-hourly settlement period `actual` grid carbon intensity (in $\text{gCO}_2/\text{kWh}$), strictly distinct from the day-ahead `forecast`.
+- **Coverage**: From `2022-01-01T00:00:00Z` through `2026-10-31T23:30:00Z` (84,720 regular 30-minute intervals).
+- **Quality & Integrity**: Exactly 100.0% integer values matching official settlement metering. Gaps $\le 2$ intervals (1 hour) are linearly interpolated with `is_imputed=True`; longer gaps are retained as missing and flagged `is_valid=False` so that windows spanning them are excluded downstream.
+
+### 2.2 Historical Weather Features & Licence
+- **Source**: Open-Meteo Historical Weather API ([https://archive-api.open-meteo.com/v1/archive](https://archive-api.open-meteo.com/v1/archive)).
+- **Licence**: Creative Commons Attribution 4.0 International ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), free for open-source and non-commercial research use with attribution.
+- **Geographic Centroid**: Central Great Britain ($52.5^\circ\text{N}, -1.5^\circ\text{W}$).
+- **Features Included**:
+  - `wind_speed`: 10m wind speed ($\text{km/h}$, primary driver of UK offshore/onshore wind generation).
+  - `cloud_cover`: Total cloud cover ($\%$).
+  - `temperature`: 2m air temperature ($^\circ\text{C}$, driver of seasonal and heating demand).
+  - `solar_radiation`: Surface shortwave solar radiation ($\text{W/m}^2$, driver of embedded PV generation).
+- **Index Alignment**: Hourly weather data is mapped to the regular 30-minute electricity settlement index via forward-filling (`ffill`).
+
+### 2.3 Future Weather Assumption
+- **Configuration Flag**: `future_weather` (default: `false` in `configs/data.yaml`).
+- **Core Assumption**: Real-time workload scheduling operates under imperfect future information. Feeding actual observed future weather into the forecast horizon would be unrealistically optimistic. Therefore, `future_weather: false` ensures models only condition on past weather and deterministic cyclic calendar features for future horizons, preserving strict causal validity.
+
+---
+
+## 3. Repository Layout
 
 ```
 carbon-aware-training/
@@ -50,12 +74,12 @@ carbon-aware-training/
 │   ├── sim.yaml              # Job grid and simulation parameters
 │   └── runner.yaml           # Pause/resume state machine settings
 ├── data/
-│   ├── raw/                  # Cached API pulls
-│   └── processed/            # Cleaned parquet series (is_imputed, is_valid)
+│   ├── raw/                  # Cached chunk pulls (git-ignored)
+│   └── processed/            # Cleaned parquet series (is_imputed, is_valid, weather)
 ├── src/
 │   ├── __init__.py
 │   ├── utils.py              # Seeds, metadata, git commit logging
-│   ├── data.py               # NESO API ingestion, cleaning & synthetic generator
+│   ├── data.py               # NESO API ingestion, cleaning & Open-Meteo fetcher
 │   ├── features.py           # Cyclic calendar features & train-only scalers
 │   ├── dataset.py            # Zero-copy index PyTorch Dataset & chronological splits
 │   ├── models.py             # N-HiTS multi-rate forecaster & statistical baselines
@@ -68,10 +92,10 @@ carbon-aware-training/
 │   └── runner.py             # Pause/resume state machine & atomic checkpointing
 ├── app/
 │   └── streamlit_app.py      # Interactive Streamlit dashboard & horizon planner
-├── checkpoints/              # Model weights and scaler artifacts
+├── checkpoints/              # Model weights and scaler artifacts (git-ignored)
 ├── results/
 │   ├── tables/               # Simulation metrics (main.csv, by_slack.csv, by_duration.csv)
-│   ├── figures/              # Publication figures
+│   ├── figures/              # Publication figures (raw_two_weeks.png, full_series.png)
 │   └── logs/                 # Training epoch metrics and energy traces
 ├── tests/                    # Pytest verification suite
 │   ├── test_data.py
@@ -88,9 +112,9 @@ carbon-aware-training/
 
 ---
 
-## 3. Quickstart
+## 4. Quickstart
 
-### 3.1 Installation
+### 4.1 Installation
 
 ```bash
 git clone <repo-url>
@@ -98,20 +122,28 @@ cd nndl-project
 python -m pip install -r requirements.txt
 ```
 
-### 3.2 Prepare Data
+### 4.2 Prepare Data
 
 ```bash
-# Fetch from NESO API or generate synthetic dataset
-python -c "from src.data import get_or_create_dataset; get_or_create_dataset()"
+# Fetch real NESO API dataset, Open-Meteo weather, and generate data quality report
+python -m src.data
 ```
 
-### 3.3 Run Unit Tests
+### 4.3 Run Unit Tests
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-### 3.4 Train Forecasters
+### 4.4 Run Baseline Simulation Benchmark
+
+```bash
+python -m src.simulate --config configs/sim.yaml
+```
+
+Outputs will be saved in `results/tables/main.csv`, `by_slack.csv`, and `by_duration.csv`.
+
+### 4.5 Train Forecasters
 
 ```bash
 # Train M0: Baseline MSE point forecaster
@@ -124,15 +156,7 @@ python -m src.train --config configs/train_m1.yaml --model-type m1
 python -m src.train --config configs/train_m2.yaml --model-type m2
 ```
 
-### 3.5 Run Simulation Benchmark
-
-```bash
-python -m src.simulate --config configs/sim.yaml
-```
-
-Outputs will be saved in `results/tables/main.csv`, `by_slack.csv`, and `by_duration.csv`.
-
-### 3.6 Launch Streamlit Horizon Planner
+### 4.6 Launch Streamlit Horizon Planner
 
 ```bash
 streamlit run app/streamlit_app.py
@@ -140,7 +164,7 @@ streamlit run app/streamlit_app.py
 
 ---
 
-## 4. Method Highlights
+## 5. Method Highlights
 
 - **N-HiTS Multi-Rate Pooling**: Hierarchical blocks pool input time series at multi-frequencies ($k \in \{8, 4, 1\}$), combining long-term backcast residuals with high-frequency forecast synthesis.
 - **Decision-Focused Learning**: Rather than minimizing MSE, M2 minimizes the expected downstream carbon emission regret under soft-argmin policy selection:
@@ -150,10 +174,6 @@ streamlit run app/streamlit_app.py
 
 ---
 
-## 5. License
+## 6. License
 
 MIT License. See [LICENSE](LICENSE) for details.
-=======
-# GridWise
-Carbon-Aware GPU Scheduling ; Forecasting Grid Carbon Intensity to Cut Training Emissions.
->>>>>>> 1ca7cb9d8173180b1c19667292560d84fe4a571c

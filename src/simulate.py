@@ -1,6 +1,8 @@
 """Simulation harness: evaluates scheduling policies across grid of jobs and test horizons."""
 
 import argparse
+import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -10,10 +12,13 @@ import torch
 
 from src.dataset import CarbonIntensityDataset, make_chronological_splits
 from src.data import get_or_create_dataset
-from src.features import fit_intensity_scaler
+from src.features import ScalerStats, fit_intensity_scaler
 from src.models import NHitsForecaster, persistence, same_time_last_week, same_time_yesterday
 from src.scheduler import Job, compute_emissions, pick_start
 from src.utils import load_config, seed_everything
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def run_batched_forecasts(
@@ -64,8 +69,6 @@ def evaluate_policies_on_test(
     # Compute baseline forecasts across all test origins
     H = test_ds.horizon
     base_pers = persistence(x_past_all, H).numpy()
-    # Invert scaling on persistence if needed, or compute from raw intensity
-    # The past features channel 0 was scaled; invert using scaler
     base_pers_raw = test_ds.scaler.inverse_transform(base_pers)
     base_yesterday_raw = test_ds.scaler.inverse_transform(same_time_yesterday(x_past_all, H).numpy())
     base_last_week_raw = test_ds.scaler.inverse_transform(same_time_last_week(x_past_all, H).numpy())
@@ -95,9 +98,7 @@ def evaluate_policies_on_test(
                     continue
 
                 y_slice_full = y_true[i]
-                # True emissions for run_now
                 e_run_now = compute_emissions(y_slice_full[0:d], power_kw)
-                # Oracle start and emissions
                 s_oracle = pick_start(y_slice_full, d, slack, tie_break_eps=tie_break_eps)
                 e_oracle = compute_emissions(y_slice_full[s_oracle : s_oracle + d], power_kw)
 
@@ -169,6 +170,51 @@ def bootstrap_summary(df: pd.DataFrame, n_bootstraps: int = 500) -> pd.DataFrame
     return pd.DataFrame(summary_rows)
 
 
+def verify_sanity_checks(summary_df: pd.DataFrame, sim_df: pd.DataFrame, by_slack: pd.DataFrame) -> None:
+    """Execute and print rigorous sanity checks required by Step 7."""
+    print("\n" + "=" * 65)
+    print("STEP 7 SANITY CHECKS VERIFICATION")
+    print("=" * 65)
+
+    # 1. run_now has exactly 0% savings and 0 bad delay
+    run_now_row = summary_df[summary_df["policy"] == "run_now"].iloc[0]
+    run_now_savings = float(run_now_row["mean_savings_pct"])
+    run_now_bad_delay = float(run_now_row["bad_delay_pct"])
+    assert np.isclose(run_now_savings, 0.0), f"run_now savings not 0: {run_now_savings}"
+    assert np.isclose(run_now_bad_delay, 0.0), f"run_now bad_delay not 0: {run_now_bad_delay}"
+    print(f"[PASS] 1. run_now savings: {run_now_savings:.4f}% (exactly 0.0%)")
+    print(f"       run_now bad delay: {run_now_bad_delay:.4f}% (exactly 0.0%)")
+
+    # 2. oracle regret is never negative
+    oracle_records = sim_df[sim_df["policy"] == "oracle"]
+    min_oracle_regret = float(oracle_records["regret_gco2"].min())
+    oracle_summary_regret = float(summary_df[summary_df["policy"] == "oracle"]["mean_regret_gco2"].iloc[0])
+    assert min_oracle_regret >= -1e-5, f"Oracle regret is negative: {min_oracle_regret}"
+    assert np.isclose(oracle_summary_regret, 0.0), f"Oracle mean regret is not 0: {oracle_summary_regret}"
+    print(f"[PASS] 2. oracle regret is never negative: min = {min_oracle_regret:.6f} gCO2, mean = {oracle_summary_regret:.6f} gCO2")
+
+    # 3. savings increase as slack increases
+    oracle_by_slack = by_slack[by_slack["policy"] == "oracle"].sort_values("slack")
+    slacks = oracle_by_slack["slack"].tolist()
+    savings = oracle_by_slack["savings_pct"].tolist()
+    is_increasing = all(savings[i] <= savings[i+1] for i in range(len(savings)-1))
+    assert is_increasing, f"Savings do not increase with slack: {savings}"
+    slack_summary = ", ".join([f"slack={s}: {val:.2f}%" for s, val in zip(slacks, savings)])
+    print(f"[PASS] 3. savings increase as slack increases: ({slack_summary})")
+
+    # 4. baselines lie between run_now and oracle
+    oracle_savings = float(summary_df[summary_df["policy"] == "oracle"]["mean_savings_pct"].iloc[0])
+    for pol in ["persistence", "yesterday", "last_week"]:
+        pol_rows = summary_df[summary_df["policy"] == pol]
+        if not pol_rows.empty:
+            pol_savings = float(pol_rows["mean_savings_pct"].iloc[0])
+            assert run_now_savings - 1e-4 <= pol_savings <= oracle_savings + 1e-4, \
+                f"Policy {pol} savings {pol_savings:.2f}% not between run_now ({run_now_savings:.2f}%) and oracle ({oracle_savings:.2f}%)"
+            print(f"[PASS] 4. baseline '{pol}' ({pol_savings:.2f}%) lies between run_now ({run_now_savings:.2f}%) and oracle ({oracle_savings:.2f}%)")
+
+    print("=" * 65 + "\n")
+
+
 def run_simulation(
     config_path: str = "configs/sim.yaml",
     checkpoint_dir: str = "checkpoints",
@@ -176,15 +222,26 @@ def run_simulation(
 ) -> None:
     """Run end-to-end evaluation and generate tables."""
     cfg = load_config(config_path)
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     df = get_or_create_dataset()
-    _, _, test_df = make_chronological_splits(df)
-    scaler = fit_intensity_scaler(df["intensity"])
+    train_df, _, test_df = make_chronological_splits(df)
+
+    # Use scaler fitted on train split only
+    scaler_path = Path("data/processed/scaler.json")
+    if scaler_path.exists():
+        with open(scaler_path, "r", encoding="utf-8") as f:
+            scaler = ScalerStats.from_dict(json.load(f))
+        logger.info(f"Loaded train-fitted scaler from {scaler_path} (mean={scaler.mean:.2f}, std={scaler.std:.2f})")
+    else:
+        scaler = fit_intensity_scaler(train_df["intensity"])
+        with open(scaler_path, "w", encoding="utf-8") as f:
+            json.dump(scaler.to_dict(), f, indent=2)
+        logger.info(f"Fitted and saved train scaler to {scaler_path} (mean={scaler.mean:.2f}, std={scaler.std:.2f})")
+
     test_ds = CarbonIntensityDataset(test_df, lookback=336, horizon=96, scaler=scaler)
 
-    # In a full run, checkpoints for m0, m1, m2 will be loaded.
-    # If no checkpoints exist yet, evaluate baseline and oracle policies directly
     forecast_dict = {}
 
     d_grid = cfg.get("d_grid", [2, 4, 8, 16])
@@ -202,19 +259,23 @@ def run_simulation(
     )
 
     # Save detailed and aggregated tables
-    sim_df.to_csv(Path(output_dir) / "sim_raw_records.csv", index=False)
+    sim_df.to_csv(output_path / "sim_raw_records.csv", index=False)
 
     summary_df = bootstrap_summary(sim_df)
-    summary_df.to_csv(Path(output_dir) / "main.csv", index=False)
+    summary_df.to_csv(output_path / "main.csv", index=False)
 
     by_slack = sim_df.groupby(["policy", "slack"])[["savings_pct", "regret_gco2", "bad_delay"]].mean().reset_index()
-    by_slack.to_csv(Path(output_dir) / "by_slack.csv", index=False)
+    by_slack.to_csv(output_path / "by_slack.csv", index=False)
 
     by_duration = sim_df.groupby(["policy", "d"])[["savings_pct", "regret_gco2", "bad_delay"]].mean().reset_index()
-    by_duration.to_csv(Path(output_dir) / "by_duration.csv", index=False)
+    by_duration.to_csv(output_path / "by_duration.csv", index=False)
 
     print("Simulation completed successfully. Results saved to:", output_dir)
+    print("\nMAIN SUMMARY TABLE (Real UK Test Split):")
     print(summary_df.to_string(index=False))
+
+    # Verify all sanity checks
+    verify_sanity_checks(summary_df, sim_df, by_slack)
 
 
 if __name__ == "__main__":

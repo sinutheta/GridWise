@@ -46,11 +46,11 @@ emissions.csv
 .codecarbon.config
 
 # Large Data & Artifacts (track directory structure with .gitkeep)
-data/raw/*
+data/raw/
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
-checkpoints/*
+checkpoints/
 !checkpoints/.gitkeep
 results/logs/*
 !results/logs/.gitkeep
