@@ -226,7 +226,12 @@ def evaluate_horizon_and_leakage(
             x_f = batch["x_future"].to(device)
             y = batch["y"].to(device)
             out = model(x_p, x_f)
-            pred_scaled = out.squeeze(-1) if out.ndim == 3 else out
+            if out.ndim == 3 and out.shape[-1] > 1:
+                pred_scaled = out[:, :, 1]  # Median quantile for M1
+            elif out.ndim == 3 and out.shape[-1] == 1:
+                pred_scaled = out.squeeze(-1)
+            else:
+                pred_scaled = out
             pred_raw = scaler.inverse_transform(pred_scaled.cpu())
 
             all_preds.append(pred_raw.numpy())

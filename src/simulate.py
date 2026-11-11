@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.conformal import ConformalCalibrator
 from src.dataset import CarbonIntensityDataset, make_chronological_splits
 from src.data import get_or_create_dataset
 from src.features import ScalerStats, fit_intensity_scaler
@@ -228,6 +229,33 @@ def verify_sanity_checks(summary_df: pd.DataFrame, sim_df: pd.DataFrame, by_slac
     print("=" * 65 + "\n")
 
 
+def load_checkpoint_forecasts(checkpoint_path: str, eval_ds: CarbonIntensityDataset, device: torch.device):
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_cfg = ckpt.get("config", {}).get("model", {})
+    instance_norm = model_cfg.get("instance_norm", False)
+    predict_change = model_cfg.get("predict_change", False)
+    quantiles = model_cfg.get("quantiles", None)
+    Q = len(quantiles) if quantiles else 1
+    model = NHitsForecaster(
+        lookback=336,
+        horizon=96,
+        in_features=len(eval_ds.past_cols),
+        future_features=len(eval_ds.future_cols),
+        pools=model_cfg.get("pool", [8, 4, 1]),
+        hidden=model_cfg.get("hidden", 128),
+        Q=Q,
+        dropout=0.0,
+        instance_norm=instance_norm,
+        predict_change=predict_change,
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    preds_scaled = run_batched_forecasts(model, eval_ds, device)
+    if preds_scaled.ndim == 3 and preds_scaled.shape[-1] == 1:
+        preds_scaled = preds_scaled.squeeze(-1)
+    preds_raw = eval_ds.scaler.inverse_transform(preds_scaled)
+    return preds_raw, Q, model
+
+
 def run_simulation(
     config_path: str = "configs/sim.yaml",
     checkpoint_dir: str = "checkpoints",
@@ -235,6 +263,7 @@ def run_simulation(
     split: str = "test",
     checkpoint_path: Optional[str] = None,
     model_name: Optional[str] = None,
+    all_models: bool = False,
 ) -> pd.DataFrame:
     """Run end-to-end evaluation and generate tables."""
     cfg = load_config(config_path)
@@ -260,35 +289,61 @@ def run_simulation(
         logger.info(f"Fitted and saved train scaler to {scaler_path} (mean={scaler.mean:.2f}, std={scaler.std:.2f})")
 
     eval_ds = CarbonIntensityDataset(eval_df, lookback=336, horizon=96, scaler=scaler)
+    val_ds = CarbonIntensityDataset(val_df, lookback=336, horizon=96, scaler=scaler)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     forecast_dict = {}
 
-    # Load neural model checkpoint if provided
-    if checkpoint_path and Path(checkpoint_path).exists():
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model_cfg = ckpt.get("config", {}).get("model", {})
-        instance_norm = model_cfg.get("instance_norm", False)
-        predict_change = model_cfg.get("predict_change", False)
-        model = NHitsForecaster(
-            lookback=336,
-            horizon=96,
-            in_features=len(eval_ds.past_cols),
-            future_features=len(eval_ds.future_cols),
-            pools=model_cfg.get("pool", [8, 4, 1]),
-            hidden=model_cfg.get("hidden", 256),
-            Q=1,
-            dropout=0.0,
-            instance_norm=instance_norm,
-            predict_change=predict_change,
-        ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        preds_scaled = run_batched_forecasts(model, eval_ds, device)
-        if preds_scaled.ndim == 3 and preds_scaled.shape[-1] == 1:
-            preds_scaled = preds_scaled.squeeze(-1)
-        preds_raw = eval_ds.scaler.inverse_transform(preds_scaled)
+    if all_models:
+        # Load M0
+        m0_ckpt = Path("checkpoints/m0_seed_0_best.pt")
+        if m0_ckpt.exists():
+            preds_m0, _, _ = load_checkpoint_forecasts(str(m0_ckpt), eval_ds, device)
+            forecast_dict["m0"] = preds_m0
+            logger.info("Loaded model 'm0' for simulation.")
+
+        # Load M1 (Quantile & Conformal Cautious)
+        m1_ckpt = Path("checkpoints/m1_seed_0_best.pt")
+        if m1_ckpt.exists():
+            preds_m1_eval, _, _ = load_checkpoint_forecasts(str(m1_ckpt), eval_ds, device)
+            forecast_dict["m1_median"] = preds_m1_eval[:, :, 1]
+            logger.info("Loaded model 'm1_median' for simulation.")
+
+            # Conformal calibration on validation split
+            preds_m1_val, _, _ = load_checkpoint_forecasts(str(m1_ckpt), val_ds, device)
+            loader_val = torch.utils.data.DataLoader(val_ds, batch_size=256, shuffle=False)
+            y_val = np.concatenate([b["y"].numpy() for b in loader_val], axis=0)
+
+            calibrator = ConformalCalibrator(alpha=0.1)
+            offsets = calibrator.fit(preds_m1_val[:, :, 0], preds_m1_val[:, :, 2], y_val)
+            torch.save(torch.from_numpy(offsets), "checkpoints/conformal_offsets.pt")
+
+            # Coverage evaluation
+            cov_metrics = calibrator.evaluate_coverage(
+                preds_m1_eval[:, :, 0] - offsets,
+                preds_m1_eval[:, :, 2] + offsets,
+                np.concatenate([b["y"].numpy() for b in torch.utils.data.DataLoader(eval_ds, batch_size=256, shuffle=False)], axis=0),
+            )
+            print(f"\n[CONFORMAL COVERAGE on {split.upper()}]: Overall={cov_metrics['overall_coverage']*100:.2f}%, Mean Width={cov_metrics['overall_width']:.2f} gCO2/kWh")
+
+            # Cautious policy uses calibrated upper bound
+            forecast_dict["m1_cautious"] = preds_m1_eval[:, :, 2] + offsets
+            logger.info("Loaded model 'm1_cautious' with calibrated conformal upper bound.")
+
+        # Load M2
+        m2_ckpt = Path("checkpoints/m2_seed_0_best.pt")
+        if m2_ckpt.exists():
+            preds_m2, _, _ = load_checkpoint_forecasts(str(m2_ckpt), eval_ds, device)
+            forecast_dict["m2"] = preds_m2
+            logger.info("Loaded model 'm2' for simulation.")
+
+    elif checkpoint_path and Path(checkpoint_path).exists():
+        preds_raw, Q, _ = load_checkpoint_forecasts(checkpoint_path, eval_ds, device)
         key = model_name or Path(checkpoint_path).stem.split("_")[0]
-        forecast_dict[key] = preds_raw
+        if Q == 3:
+            forecast_dict[f"{key}_median"] = preds_raw[:, :, 1]
+        else:
+            forecast_dict[key] = preds_raw
         logger.info(f"Loaded model '{key}' from {checkpoint_path} for simulation.")
 
     d_grid = cfg.get("d_grid", [2, 4, 8, 16])
@@ -334,6 +389,7 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=None)
+    parser.add_argument("--all-models", action="store_true", help="Simulate all trained models (m0, m1_median, m1_cautious, m2)")
     args = parser.parse_args()
 
     run_simulation(
@@ -342,4 +398,5 @@ if __name__ == "__main__":
         split=args.split,
         checkpoint_path=args.checkpoint,
         model_name=args.model_name,
+        all_models=args.all_models,
     )
