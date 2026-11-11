@@ -268,6 +268,8 @@ def run_simulation(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model_cfg = ckpt.get("config", {}).get("model", {})
+        instance_norm = model_cfg.get("instance_norm", False)
+        predict_change = model_cfg.get("predict_change", False)
         model = NHitsForecaster(
             lookback=336,
             horizon=96,
@@ -277,6 +279,8 @@ def run_simulation(
             hidden=model_cfg.get("hidden", 256),
             Q=1,
             dropout=0.0,
+            instance_norm=instance_norm,
+            predict_change=predict_change,
         ).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
         preds_scaled = run_batched_forecasts(model, eval_ds, device)

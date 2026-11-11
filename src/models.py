@@ -101,6 +101,8 @@ class NHitsForecaster(nn.Module):
         hidden: int = 256,
         Q: int = 1,
         dropout: float = 0.1,
+        instance_norm: bool = False,
+        predict_change: bool = False,
     ):
         super().__init__()
         self.lookback = lookback
@@ -109,6 +111,8 @@ class NHitsForecaster(nn.Module):
         self.future_features = future_features
         self.pools = pools
         self.Q = Q
+        self.instance_norm = instance_norm
+        self.predict_change = predict_change
 
         self.blocks = nn.ModuleList([
             NHitsBlock(
@@ -137,6 +141,16 @@ class NHitsForecaster(nn.Module):
             forecast: (B, H, Q)
         """
         curr_past = x_past
+
+        if self.instance_norm:
+            # Per-window normalization of lookback intensity (channel 0)
+            target_series = x_past[:, :, 0:1]  # (B, L, 1)
+            mean = target_series.mean(dim=1, keepdim=True)  # (B, 1, 1)
+            std = target_series.std(dim=1, keepdim=True) + 1e-5  # (B, 1, 1)
+            norm_target = (target_series - mean) / std
+            curr_past = torch.cat([norm_target, x_past[:, :, 1:]], dim=-1)
+            last_norm = norm_target[:, -1:, :]  # (B, 1, 1)
+
         total_forecast = None
 
         for block in self.blocks:
@@ -149,6 +163,13 @@ class NHitsForecaster(nn.Module):
                 total_forecast = forecast
             else:
                 total_forecast = total_forecast + forecast
+
+        if self.instance_norm:
+            if self.predict_change:
+                # Anchor on the last observed normalized value in window
+                total_forecast = total_forecast + last_norm
+            # Undo per-window normalization on output
+            total_forecast = total_forecast * std + mean
 
         return total_forecast
 

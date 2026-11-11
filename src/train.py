@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from src.dataset import CarbonIntensityDataset, make_chronological_splits
 from src.data import get_or_create_dataset
 from src.features import fit_intensity_scaler
-from src.losses import compute_oracle_regret, decision_loss, pinball_loss
+from src.losses import compute_oracle_regret, decision_loss, pinball_loss, start_mask, window_sums
 from src.models import NHitsForecaster, persistence, same_time_last_week, same_time_yesterday
 from src.utils import get_metadata, load_config, seed_everything
 
@@ -135,15 +135,38 @@ def evaluate(
         mae_sum += abs_err.sum().item()
         mse_sum += sq_err.sum().item()
 
-        # Decision regret on representative job (e.g. d=4, slack=24)
-        reg = compute_oracle_regret(pred_raw, y, d=4, slack=24)
-        regret_sum += reg.sum().item()
+        # Decision regret across full simulator job grid matching simulate.py identically:
+        # d in [2, 4, 8, 16], slack in [12, 24, 48], power_kw=1.0, slot_hours=0.5
+        B, H = pred_raw.shape
+        d_grid = [2, 4, 8, 16]
+        slack_grid = [12, 24, 48]
+        tie_break_eps = 1e-4
+
+        for d in d_grid:
+            W_hat = window_sums(pred_raw, d)
+            W = window_sums(y, d)
+            n_starts = H - d + 1
+            idx_pen = torch.arange(n_starts, dtype=pred_raw.dtype, device=device) * tie_break_eps
+            for slack in slack_grid:
+                m = start_mask(H, d, slack, device)
+                Wh = (W_hat + idx_pen).masked_fill(~m, float("inf"))
+                Wt = (W + idx_pen).masked_fill(~m, float("inf"))
+
+                s_pred = Wh.argmin(dim=1, keepdim=True)
+                s_oracle = Wt.argmin(dim=1, keepdim=True)
+
+                e_pred = W.gather(1, s_pred).squeeze(1) * 0.5
+                e_oracle = W.gather(1, s_oracle).squeeze(1) * 0.5
+
+                reg = e_pred - e_oracle
+                regret_sum += reg.sum().item()
 
         n_samples += mask.sum().item()
 
     mae = mae_sum / max(n_samples, 1)
     rmse = np.sqrt(mse_sum / max(n_samples, 1))
-    regret = regret_sum / max(len(loader.dataset), 1)
+    total_eval_jobs = len(loader.dataset) * len(d_grid) * len(slack_grid)
+    regret = regret_sum / max(total_eval_jobs, 1)
 
     return {"mae": mae, "rmse": rmse, "regret": regret}
 
@@ -275,6 +298,7 @@ def run_training(
     device_name: Optional[str] = None,
     save_dir: str = "checkpoints",
     log_dir: str = "results/logs",
+    save_name: Optional[str] = None,
 ) -> Path:
     """Run full training pipeline for a given model type and random seed."""
     cfg = load_config(config_path)
@@ -318,6 +342,9 @@ def run_training(
     F_past = len(train_ds.past_cols)
     F_future = len(train_ds.future_cols)
 
+    instance_norm = model_cfg.get("instance_norm", False)
+    predict_change = model_cfg.get("predict_change", False)
+
     model = NHitsForecaster(
         lookback=lookback,
         horizon=horizon,
@@ -327,6 +354,8 @@ def run_training(
         hidden=hidden,
         Q=Q,
         dropout=dropout,
+        instance_norm=instance_norm,
+        predict_change=predict_change,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -334,14 +363,15 @@ def run_training(
 
     # Logging setup
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_file = Path(log_dir) / f"{model_type}_seed_{seed}.csv"
+    save_stem = save_name or f"{model_type}_seed_{seed}"
+    log_file = Path(log_dir) / f"{save_stem}.csv"
     with open(log_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_mae", "val_rmse", "val_regret", "lr", "epoch_time_s"])
 
     best_metric = float("inf")
     patience_counter = 0
-    best_checkpoint_path = Path(save_dir) / f"{model_type}_seed_{seed}_best.pt"
+    best_checkpoint_path = Path(save_dir) / f"{save_stem}_best.pt"
     best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     loss_cfg = cfg.get("loss", {})
@@ -421,6 +451,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-type", type=str, default="m0", choices=["m0", "m1", "m2"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--save-name", type=str, default=None)
     args = parser.parse_args()
 
     run_training(
@@ -428,4 +459,5 @@ if __name__ == "__main__":
         model_type=args.model_type,
         seed=args.seed,
         device_name=args.device,
+        save_name=args.save_name,
     )

@@ -6,14 +6,16 @@ data:
 model:
   blocks: 3
   pool: [8, 4, 1]
-  hidden: 256
-  dropout: 0.1
+  hidden: 128
+  dropout: 0.25
   quantiles: null
+  instance_norm: true
+  predict_change: true
 loss:
   type: mse
 train:
-  lr: 1.0e-3
-  weight_decay: 1.0e-4
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
   epochs: 50
   batch_size: 256
   early_stop_patience: 5
