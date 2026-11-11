@@ -136,13 +136,14 @@ class NHitsForecaster(nn.Module):
         Returns:
             forecast: (B, H, Q)
         """
-        curr_past = x_past.clone()
+        curr_past = x_past
         total_forecast = None
 
         for block in self.blocks:
             backcast, forecast = block(curr_past, x_future)
-            # Subtract backcast from target channel (channel 0)
-            curr_past[:, :, 0] = curr_past[:, :, 0] - backcast
+            # Subtract backcast from target channel (channel 0) out-of-place
+            target_residual = curr_past[:, :, 0] - backcast
+            curr_past = torch.cat([target_residual.unsqueeze(-1), curr_past[:, :, 1:]], dim=-1)
 
             if total_forecast is None:
                 total_forecast = forecast

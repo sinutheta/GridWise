@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from src.data import clean_intensity, generate_synthetic_intensity, parse_intensity_response
 from src.features import add_calendar_features, fit_intensity_scaler
@@ -170,3 +171,64 @@ def test_splits_and_dataset_windowing():
     assert sample["x_future"].shape == (96, 8)
     assert sample["y"].shape == (96,)
     assert sample["mask"].shape == (96,)
+
+
+def test_no_window_crossing_invalid_slots():
+    """Verify that CarbonIntensityDataset guarantees no training or eval window crosses an invalid slot."""
+    # Create 1000 half-hour steps (lookback=336, horizon=96)
+    times = pd.date_range("2023-01-01 00:00", periods=1000, freq="30min", tz="UTC")
+    vals = np.ones(1000) * 120.0
+    df = pd.DataFrame({"timestamp": times, "intensity": vals, "is_valid": True, "is_imputed": False})
+
+    # Inject an invalid block of slots at index 450:460
+    df.loc[450:459, "intensity"] = np.nan
+    df.loc[450:459, "is_valid"] = False
+
+    scaler = fit_intensity_scaler(df["intensity"])
+    ds = CarbonIntensityDataset(df, lookback=336, horizon=96, scaler=scaler)
+
+    # Check every window produced by the dataset
+    for i in range(len(ds)):
+        item = ds[i]
+        origin = int(item["origin_idx"].item())
+        # Past window [origin - 336, origin)
+        past_slots_valid = df.loc[origin - 336 : origin - 1, "is_valid"].all()
+        # Future window [origin, origin + 96)
+        future_slots_valid = df.loc[origin : origin + 96 - 1, "is_valid"].all()
+
+        assert past_slots_valid, f"Past window for origin {origin} crosses invalid slot!"
+        assert future_slots_valid, f"Future window for origin {origin} crosses invalid slot!"
+        assert not torch.isnan(item["x_past"][:, 0]).any()
+        assert not torch.isnan(item["y"]).any()
+        assert torch.all(item["mask"] == 1.0)
+
+
+def test_mae_by_horizon_calculation():
+    """Verify exact correctness of compute_mae_by_horizon across all standard forecast horizons."""
+    from src.train import compute_mae_by_horizon
+
+    # 10 samples, 96 horizon steps
+    # Construct y_true with base 100
+    y_true = np.ones((10, 96), dtype=np.float32) * 100.0
+
+    # Construct preds with specific errors at horizons:
+    # 1h  (slot 2, idx 1): error = 5.0
+    # 6h  (slot 12, idx 11): error = 10.0
+    # 12h (slot 24, idx 23): error = 15.0
+    # 24h (slot 48, idx 47): error = 20.0
+    # 48h (slot 96, idx 95): error = 25.0
+    preds = y_true.copy()
+    preds[:, 1] += 5.0
+    preds[:, 11] -= 10.0
+    preds[:, 23] += 15.0
+    preds[:, 47] -= 20.0
+    preds[:, 95] += 25.0
+
+    mae_dict = compute_mae_by_horizon(preds, y_true)
+
+    assert np.isclose(mae_dict["1h"], 5.0)
+    assert np.isclose(mae_dict["6h"], 10.0)
+    assert np.isclose(mae_dict["12h"], 15.0)
+    assert np.isclose(mae_dict["24h"], 20.0)
+    assert np.isclose(mae_dict["48h"], 25.0)
+

@@ -67,13 +67,11 @@ class CarbonIntensityDataset(Dataset):
         self.is_valid = self.df.get("is_valid", pd.Series(True, index=self.df.index)).to_numpy(dtype=bool)
 
         # Build valid origin indices
-        # An origin t must have [t - lookback, t) in past and [t, t + horizon) in future
+        # Both past [t - lookback, t) and future [t, t + horizon) must be fully valid (no invalid slots)
         n_total = len(self.df)
         valid_indices = []
         for t in range(self.lookback, n_total - self.horizon + 1):
-            # The past window must be fully valid (or minimally valid)
-            past_valid = np.all(self.is_valid[t - self.lookback : t])
-            if past_valid:
+            if np.all(self.is_valid[t - self.lookback : t + self.horizon]):
                 valid_indices.append(t)
 
         self.origin_indices = np.array(valid_indices, dtype=np.int64)

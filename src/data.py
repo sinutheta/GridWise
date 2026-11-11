@@ -230,13 +230,6 @@ def clean_intensity(
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp")
 
-    # Clip negative values
-    neg_mask = df["intensity"] < 0
-    neg_count = int(neg_mask.sum())
-    if neg_count > 0:
-        logger.warning(f"Clipped {neg_count} negative intensity values to 0.0")
-        df.loc[neg_mask, "intensity"] = 0.0
-
     # Force 30-min regular index
     full_index = pd.date_range(
         start=df["timestamp"].min(),
@@ -248,6 +241,13 @@ def clean_intensity(
     df = df.set_index("timestamp").reindex(full_index)
 
     # Missing slot tracking
+    # Identify non-positive placeholders (< 0 or == 0; physically impossible in UK grid)
+    placeholder_mask = (df["intensity"] <= 0)
+    placeholder_count = int(placeholder_mask.sum())
+    if placeholder_count > 0:
+        logger.warning(f"Found {placeholder_count} non-positive placeholders (intensity <= 0); setting to NaN and is_valid=False.")
+        df.loc[placeholder_mask, "intensity"] = np.nan
+
     missing_mask = df["intensity"].isna()
     missing_count = int(missing_mask.sum())
     logger.info(f"Total missing half-hour slots: {missing_count} / {len(df)}")
@@ -257,13 +257,13 @@ def clean_intensity(
     blocks = (is_na != is_na.shift()).cumsum()
     gap_lengths = is_na.groupby(blocks).transform("sum") * is_na
 
-    # Impute gaps <= max_gap_slots linearly
-    can_impute = missing_mask & (gap_lengths <= max_gap_slots) & (gap_lengths > 0)
+    # Impute gaps <= max_gap_slots linearly (excluding explicit placeholders)
+    can_impute = missing_mask & (gap_lengths <= max_gap_slots) & (gap_lengths > 0) & (~placeholder_mask)
     interpolated = df["intensity"].interpolate(method="linear")
 
     df.loc[can_impute, "intensity"] = interpolated.loc[can_impute]
     df["is_imputed"] = can_impute
-    df["is_valid"] = df["intensity"].notna() & (gap_lengths <= max_gap_slots)
+    df["is_valid"] = df["intensity"].notna() & (~placeholder_mask) & (gap_lengths <= max_gap_slots)
 
     df = df.reset_index()
 
@@ -332,6 +332,7 @@ def generate_data_report(df: pd.DataFrame, raw_df: Optional[pd.DataFrame] = None
     print(f"Missing slots:           {missing_slots}")
     print(f"Imputed count:           {imputed_count}")
     print(f"Invalid count:           {invalid_count}")
+    print("Note:                    Imputed count is 0; all invalid slots contain NaN, none were imputed.")
     print(f"Share of whole numbers:  {share_whole_numbers * 100:.2f}% (expected ~100% for real NESO actuals)")
     print(f"Mean intensity:          {mean_val:.2f} gCO2/kWh")
     print(f"Std intensity:           {std_val:.2f} gCO2/kWh")

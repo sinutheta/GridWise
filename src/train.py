@@ -5,9 +5,10 @@ import csv
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -16,7 +17,7 @@ from src.dataset import CarbonIntensityDataset, make_chronological_splits
 from src.data import get_or_create_dataset
 from src.features import fit_intensity_scaler
 from src.losses import compute_oracle_regret, decision_loss, pinball_loss
-from src.models import NHitsForecaster
+from src.models import NHitsForecaster, persistence, same_time_last_week, same_time_yesterday
 from src.utils import get_metadata, load_config, seed_everything
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,126 @@ def evaluate(
     regret = regret_sum / max(len(loader.dataset), 1)
 
     return {"mae": mae, "rmse": rmse, "regret": regret}
+
+
+def compute_mae_by_horizon(
+    preds: Union[np.ndarray, torch.Tensor],
+    y_true: Union[np.ndarray, torch.Tensor],
+    horizons_dict: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
+    """Compute Mean Absolute Error at specified lookahead horizons (in slots).
+    
+    Default horizons:
+      1h  -> slot 2 (1 hour = 2 half-hours)
+      6h  -> slot 12
+      12h -> slot 24
+      24h -> slot 48
+      48h -> slot 96
+    """
+    if horizons_dict is None:
+        horizons_dict = {
+            "1h": 2,
+            "6h": 12,
+            "12h": 24,
+            "24h": 48,
+            "48h": 96,
+        }
+
+    p = np.asarray(preds)
+    y = np.asarray(y_true)
+
+    results = {}
+    for name, slot in horizons_dict.items():
+        idx = slot - 1
+        if idx < p.shape[1] and idx < y.shape[1]:
+            err = np.abs(p[:, idx] - y[:, idx])
+            results[name] = float(np.nanmean(err))
+    return results
+
+
+def evaluate_horizon_and_leakage(
+    model: nn.Module,
+    val_loader: DataLoader,
+    val_ds: CarbonIntensityDataset,
+    device: torch.device,
+    scaler: Any,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Compute MAE by horizon vs baselines and perform target-shuffling leakage test."""
+    model.eval()
+
+    all_y = []
+    all_x_past = []
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            x_p = batch["x_past"].to(device)
+            x_f = batch["x_future"].to(device)
+            y = batch["y"].to(device)
+            out = model(x_p, x_f)
+            pred_scaled = out.squeeze(-1) if out.ndim == 3 else out
+            pred_raw = scaler.inverse_transform(pred_scaled.cpu())
+
+            all_preds.append(pred_raw.numpy())
+            all_y.append(y.cpu().numpy())
+            all_x_past.append(batch["x_past"].cpu())
+
+    y_true = np.concatenate(all_y, axis=0)
+    preds_m0 = np.concatenate(all_preds, axis=0)
+    x_past_all = torch.cat(all_x_past, dim=0)
+
+    # Compute baseline predictions
+    H = val_ds.horizon
+    preds_pers = scaler.inverse_transform(persistence(x_past_all, H).numpy())
+    preds_yest = scaler.inverse_transform(same_time_yesterday(x_past_all, H).numpy())
+    preds_last_week = scaler.inverse_transform(same_time_last_week(x_past_all, H).numpy())
+
+    horizons = {"1h": 2, "6h": 12, "12h": 24, "24h": 48, "48h": 96}
+    mae_m0 = compute_mae_by_horizon(preds_m0, y_true, horizons)
+    mae_pers = compute_mae_by_horizon(preds_pers, y_true, horizons)
+    mae_yest = compute_mae_by_horizon(preds_yest, y_true, horizons)
+    mae_last_week = compute_mae_by_horizon(preds_last_week, y_true, horizons)
+
+    horizon_rows = []
+    for h_name in horizons.keys():
+        horizon_rows.append({
+            "horizon": h_name,
+            "persistence": mae_pers[h_name],
+            "yesterday": mae_yest[h_name],
+            "last_week": mae_last_week[h_name],
+            "m0": mae_m0[h_name],
+        })
+    horizon_df = pd.DataFrame(horizon_rows)
+
+    print("\n" + "=" * 65)
+    print("VALIDATION MAE BY HORIZON (gCO2/kWh)")
+    print("=" * 65)
+    print(horizon_df.to_string(index=False))
+    print("=" * 65)
+
+    # PART E: Leakage check - shuffle targets across windows and re-score M0
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(len(y_true))
+    y_shuffled = y_true[perm]
+
+    orig_mae = float(np.mean(np.abs(preds_m0 - y_true)))
+    shuffled_mae = float(np.mean(np.abs(preds_m0 - y_shuffled)))
+
+    leakage_results = {
+        "original_val_mae": orig_mae,
+        "shuffled_val_mae": shuffled_mae,
+        "degradation_pct": ((shuffled_mae - orig_mae) / orig_mae) * 100.0,
+    }
+
+    print("\n" + "=" * 65)
+    print("PART E: LEAKAGE CHECK (Target Shuffling Test)")
+    print("=" * 65)
+    print(f"Original Validation MAE:  {orig_mae:.2f} gCO2/kWh")
+    print(f"Shuffled Validation MAE:  {shuffled_mae:.2f} gCO2/kWh")
+    print(f"Degradation:              +{leakage_results['degradation_pct']:.1f}% error increase")
+    print("=" * 65 + "\n")
+
+    return horizon_df, leakage_results
 
 
 def run_training(
@@ -276,6 +397,20 @@ def run_training(
             if patience_counter >= patience:
                 logger.info(f"Early stopping triggered after {epoch} epochs.")
                 break
+
+    # Load best checkpoint for post-training validation evaluations
+    logger.info(f"Loading best checkpoint from {best_checkpoint_path} for evaluation...")
+    best_ckpt = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+
+    # Part C & Part E: Validation MAE by horizon and Leakage check
+    evaluate_horizon_and_leakage(
+        model=model,
+        val_loader=val_loader,
+        val_ds=val_ds,
+        device=device,
+        scaler=scaler,
+    )
 
     return best_checkpoint_path
 

@@ -41,7 +41,11 @@ flowchart TD
 - **Source**: National Energy System Operator (NESO) Carbon Intensity API ([https://api.carbonintensity.org.uk](https://api.carbonintensity.org.uk)).
 - **Target Variable**: Half-hourly settlement period `actual` grid carbon intensity (in $\text{gCO}_2/\text{kWh}$), strictly distinct from the day-ahead `forecast`.
 - **Coverage**: From `2022-01-01T00:00:00Z` through `2026-10-31T23:30:00Z` (84,720 regular 30-minute intervals).
-- **Quality & Integrity**: Exactly 100.0% integer values matching official settlement metering. Gaps $\le 2$ intervals (1 hour) are linearly interpolated with `is_imputed=True`; longer gaps are retained as missing and flagged `is_valid=False` so that windows spanning them are excluded downstream.
+- **Quality & Integrity**: Exactly 100.0% integer values matching official settlement metering. In the downloaded dataset, all missing slots (178 slots in multi-hour outages) and 6 zero/non-positive sensor dropout placeholders ($\le 0$) were confirmed invalid, resulting in 184 total invalid slots containing NaN (`is_valid=False`, `is_imputed=False`), none of which were imputed. All windows spanning any invalid slots across lookback or forecast horizons are strictly excluded from training and evaluation.
+
+### 2.2 Simulation Metrics & Bootstrap Methodology
+- **Savings & Regret Standard Errors**: In `main.csv` and `main_val.csv`, the column `savings_pct_boot_se` (formerly `savings_pct_std`) records the **bootstrap standard error of the mean savings** across origin clusters, rather than the raw sample standard deviation across individual jobs.
+- **Bootstrap Block Size**: The bootstrap resamples at the block unit of **1 origin timestamp** (each block comprising all 12 job combinations evaluated at that origin across duration $d \in \{2, 4, 8, 16\}$ and slack $\in \{12, 24, 48\}$ half-hours).
 
 ### 2.2 Historical Weather Features & Licence
 - **Source**: Open-Meteo Historical Weather API ([https://archive-api.open-meteo.com/v1/archive](https://archive-api.open-meteo.com/v1/archive)).

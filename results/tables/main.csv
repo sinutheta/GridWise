@@ -1,4 +1,4 @@
-policy,mean_savings_pct,savings_pct_std,savings_pct_ci95_lo,savings_pct_ci95_hi,mean_regret_gco2,regret_gco2_std,bad_delay_pct
+policy,mean_savings_pct,savings_pct_boot_se,savings_pct_ci95_lo,savings_pct_ci95_hi,mean_regret_gco2,regret_gco2_boot_se,bad_delay_pct
 run_now,0.0,0.0,0.0,0.0,110.18000854983728,0.6347791367925968,0.0
 oracle,24.395247563898693,0.11074432937572799,24.18334204049904,24.61686895698421,0.0,0.0,0.0
 persistence,0.0,0.0,0.0,0.0,110.18000854983728,0.6384314729690577,0.0

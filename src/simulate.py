@@ -134,7 +134,12 @@ def evaluate_policies_on_test(
 
 
 def bootstrap_summary(df: pd.DataFrame, n_bootstraps: int = 500) -> pd.DataFrame:
-    """Bootstrap aggregate metrics across origins to estimate standard errors and confidence intervals."""
+    """Bootstrap aggregate metrics across origins to estimate standard errors and confidence intervals.
+    
+    The 'savings_pct_boot_se' column represents the bootstrap standard error of the mean savings
+    across clustered origin blocks (block size = 1 origin timestamp, containing all 12 evaluated jobs
+    spanning duration d in {2, 4, 8, 16} and slack in {12, 24, 48}), not the across-job sample standard deviation.
+    """
     summary_rows = []
     policies = df["policy"].unique()
     origins = df["origin_idx"].unique()
@@ -159,11 +164,11 @@ def bootstrap_summary(df: pd.DataFrame, n_bootstraps: int = 500) -> pd.DataFrame
         summary_rows.append({
             "policy": pol,
             "mean_savings_pct": mean_savings_pct,
-            "savings_pct_std": np.std(boot_savings),
+            "savings_pct_boot_se": np.std(boot_savings),
             "savings_pct_ci95_lo": np.percentile(boot_savings, 2.5),
             "savings_pct_ci95_hi": np.percentile(boot_savings, 97.5),
             "mean_regret_gco2": mean_regret,
-            "regret_gco2_std": np.std(boot_regrets),
+            "regret_gco2_boot_se": np.std(boot_regrets),
             "bad_delay_pct": bad_delay_rate,
         })
 
@@ -173,7 +178,7 @@ def bootstrap_summary(df: pd.DataFrame, n_bootstraps: int = 500) -> pd.DataFrame
 def verify_sanity_checks(summary_df: pd.DataFrame, sim_df: pd.DataFrame, by_slack: pd.DataFrame) -> None:
     """Execute and print rigorous sanity checks required by Step 7."""
     print("\n" + "=" * 65)
-    print("STEP 7 SANITY CHECKS VERIFICATION")
+    print("SANITY CHECKS & BY-SLACK VERIFICATION")
     print("=" * 65)
 
     # 1. run_now has exactly 0% savings and 0 bad delay
@@ -193,14 +198,22 @@ def verify_sanity_checks(summary_df: pd.DataFrame, sim_df: pd.DataFrame, by_slac
     assert np.isclose(oracle_summary_regret, 0.0), f"Oracle mean regret is not 0: {oracle_summary_regret}"
     print(f"[PASS] 2. oracle regret is never negative: min = {min_oracle_regret:.6f} gCO2, mean = {oracle_summary_regret:.6f} gCO2")
 
-    # 3. savings increase as slack increases
-    oracle_by_slack = by_slack[by_slack["policy"] == "oracle"].sort_values("slack")
-    slacks = oracle_by_slack["slack"].tolist()
-    savings = oracle_by_slack["savings_pct"].tolist()
-    is_increasing = all(savings[i] <= savings[i+1] for i in range(len(savings)-1))
-    assert is_increasing, f"Savings do not increase with slack: {savings}"
-    slack_summary = ", ".join([f"slack={s}: {val:.2f}%" for s, val in zip(slacks, savings)])
-    print(f"[PASS] 3. savings increase as slack increases: ({slack_summary})")
+    # 3. savings by slack for every policy
+    print("\nSavings by slack for every policy:")
+    for pol in by_slack["policy"].unique():
+        pol_slack = by_slack[by_slack["policy"] == pol].sort_values("slack")
+        slacks = pol_slack["slack"].tolist()
+        savings = pol_slack["savings_pct"].tolist()
+        s_str = ", ".join([f"slack={int(s)}: {val:.2f}%" for s, val in zip(slacks, savings)])
+        
+        is_increasing = all(savings[i] <= savings[i+1] + 1e-4 for i in range(len(savings)-1))
+        status = "[PASS]" if is_increasing else "[NOTE: slight non-monotonicity at large slack]"
+        print(f"  {status:<10} {pol:<12}: {s_str}")
+
+    # Strict monotonicity check for oracle
+    oracle_slack = by_slack[by_slack["policy"] == "oracle"].sort_values("slack")["savings_pct"].tolist()
+    assert all(oracle_slack[i] <= oracle_slack[i+1] for i in range(len(oracle_slack)-1)), \
+        f"Oracle savings do not increase with slack: {oracle_slack}"
 
     # 4. baselines lie between run_now and oracle
     oracle_savings = float(summary_df[summary_df["policy"] == "oracle"]["mean_savings_pct"].iloc[0])
@@ -219,14 +232,20 @@ def run_simulation(
     config_path: str = "configs/sim.yaml",
     checkpoint_dir: str = "checkpoints",
     output_dir: str = "results/tables",
-) -> None:
+    split: str = "test",
+    checkpoint_path: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> pd.DataFrame:
     """Run end-to-end evaluation and generate tables."""
     cfg = load_config(config_path)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     df = get_or_create_dataset()
-    train_df, _, test_df = make_chronological_splits(df)
+    train_df, val_df, test_df = make_chronological_splits(df)
+
+    eval_df = val_df if split == "val" else test_df
+    logger.info(f"Running simulation on split='{split}' ({len(eval_df)} rows: {eval_df['timestamp'].min()} to {eval_df['timestamp'].max()})")
 
     # Use scaler fitted on train split only
     scaler_path = Path("data/processed/scaler.json")
@@ -240,9 +259,33 @@ def run_simulation(
             json.dump(scaler.to_dict(), f, indent=2)
         logger.info(f"Fitted and saved train scaler to {scaler_path} (mean={scaler.mean:.2f}, std={scaler.std:.2f})")
 
-    test_ds = CarbonIntensityDataset(test_df, lookback=336, horizon=96, scaler=scaler)
+    eval_ds = CarbonIntensityDataset(eval_df, lookback=336, horizon=96, scaler=scaler)
 
     forecast_dict = {}
+
+    # Load neural model checkpoint if provided
+    if checkpoint_path and Path(checkpoint_path).exists():
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model_cfg = ckpt.get("config", {}).get("model", {})
+        model = NHitsForecaster(
+            lookback=336,
+            horizon=96,
+            in_features=len(eval_ds.past_cols),
+            future_features=len(eval_ds.future_cols),
+            pools=model_cfg.get("pool", [8, 4, 1]),
+            hidden=model_cfg.get("hidden", 256),
+            Q=1,
+            dropout=0.0,
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        preds_scaled = run_batched_forecasts(model, eval_ds, device)
+        if preds_scaled.ndim == 3 and preds_scaled.shape[-1] == 1:
+            preds_scaled = preds_scaled.squeeze(-1)
+        preds_raw = eval_ds.scaler.inverse_transform(preds_scaled)
+        key = model_name or Path(checkpoint_path).stem.split("_")[0]
+        forecast_dict[key] = preds_raw
+        logger.info(f"Loaded model '{key}' from {checkpoint_path} for simulation.")
 
     d_grid = cfg.get("d_grid", [2, 4, 8, 16])
     slack_grid = cfg.get("slack_grid", [12, 24, 48, 96])
@@ -250,7 +293,7 @@ def run_simulation(
     tie_break_eps = float(cfg.get("tie_break_eps", 1e-4))
 
     sim_df = evaluate_policies_on_test(
-        test_ds=test_ds,
+        test_ds=eval_ds,
         forecast_dict=forecast_dict,
         d_grid=d_grid,
         slack_grid=slack_grid,
@@ -258,30 +301,41 @@ def run_simulation(
         tie_break_eps=tie_break_eps,
     )
 
-    # Save detailed and aggregated tables
-    sim_df.to_csv(output_path / "sim_raw_records.csv", index=False)
+    # Determine file suffixes
+    suffix = "_val" if split == "val" else ""
+    sim_df.to_csv(output_path / f"sim_raw_records{suffix}.csv", index=False)
 
     summary_df = bootstrap_summary(sim_df)
-    summary_df.to_csv(output_path / "main.csv", index=False)
+    summary_df.to_csv(output_path / f"main{suffix}.csv", index=False)
 
     by_slack = sim_df.groupby(["policy", "slack"])[["savings_pct", "regret_gco2", "bad_delay"]].mean().reset_index()
-    by_slack.to_csv(output_path / "by_slack.csv", index=False)
+    by_slack.to_csv(output_path / f"by_slack{suffix}.csv", index=False)
 
     by_duration = sim_df.groupby(["policy", "d"])[["savings_pct", "regret_gco2", "bad_delay"]].mean().reset_index()
-    by_duration.to_csv(output_path / "by_duration.csv", index=False)
+    by_duration.to_csv(output_path / f"by_duration{suffix}.csv", index=False)
 
-    print("Simulation completed successfully. Results saved to:", output_dir)
-    print("\nMAIN SUMMARY TABLE (Real UK Test Split):")
+    print(f"Simulation on {split.upper()} split completed successfully. Results saved to: {output_dir}")
+    print(f"\nMAIN SUMMARY TABLE ({split.upper()} Split):")
     print(summary_df.to_string(index=False))
 
     # Verify all sanity checks
     verify_sanity_checks(summary_df, sim_df, by_slack)
+    return summary_df
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/sim.yaml")
     parser.add_argument("--output-dir", type=str, default="results/tables")
+    parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--model-name", type=str, default=None)
     args = parser.parse_args()
 
-    run_simulation(config_path=args.config, output_dir=args.output_dir)
+    run_simulation(
+        config_path=args.config,
+        output_dir=args.output_dir,
+        split=args.split,
+        checkpoint_path=args.checkpoint,
+        model_name=args.model_name,
+    )
